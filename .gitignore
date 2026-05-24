@@ -1,0 +1,10 @@
+/asm
+/build
+/.vscode
+/.cache
+
+compile_commands.json
+
+*.z64
+
+*.ps1
