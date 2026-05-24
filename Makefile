@@ -1,4 +1,4 @@
-all: sharkdumper.z64
+all: swapdumper.z64
 .PHONY: all
 .SECONDARY:
 
@@ -10,9 +10,9 @@ OBJS = $(BUILD_DIR)/main.o $(BUILD_DIR)/pif.o $(BUILD_DIR)/accessory.o
 
 N64_CFLAGS += -std=gnu2x -Os -G0
 
-sharkdumper.z64: N64_ROM_TITLE = "N64 SwapDumper"
+swapdumper.z64: N64_ROM_TITLE = "N64 SwapDumper"
 
-$(BUILD_DIR)/sharkdumper.elf: $(OBJS)
+$(BUILD_DIR)/swapdumper.elf: $(OBJS)
 
 clean:
 	rm -rf $(BUILD_DIR) *.z64

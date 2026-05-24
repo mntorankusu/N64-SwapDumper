@@ -19,6 +19,7 @@
 #define CART_TITLE_LENGTH 20
 #define CART_PRODUCT_OFFSET 0x3B
 #define CART_PRODUCT_LENGTH 4
+#define CART_REVISION_OFFSET (CART_PRODUCT_OFFSET + CART_PRODUCT_LENGTH)
 #define CART_REGION_OFFSET 0x3E
 #define CART_MIN_SIZE 0x400000
 #define CART_MAX_SIZE 0x4000000
@@ -36,7 +37,10 @@
 #define COMP_HASH_BITS 15
 #define COMP_HASH_SIZE (1 << COMP_HASH_BITS)
 #define COMP_MIN_MATCH 4
+#define COMP_SKIP_STRENGTH 5
 #define COMP_RAW_FLAG 0x80000000u
+#define CRC32_POLY 0xEDB88320u
+#define CHECKSUM_READ_SIZE 0x100000
 #define PROGRESS_BAR_WIDTH 40
 #define ROM_BUFFER_ALIGN 0x10000
 
@@ -106,6 +110,7 @@ typedef struct {
     uint8_t header[CART_HEADER_SIZE];
     char title[CART_TITLE_LENGTH + 1];
     char product[CART_PRODUCT_LENGTH + 1];
+    uint8_t revision;
     char rom_path[32];
     char save_path[32];
     uint8_t region;
@@ -227,11 +232,34 @@ static char printable_header_char(uint8_t ch) {
     return (ch >= 0x20 && ch <= 0x7E) ? (char)ch : '_';
 }
 
-static void set_cart_paths(cart_info_t *info, bool use_rom_dir, bool use_save_dir) {
-    snprintf(info->rom_path, sizeof(info->rom_path), "%s/%s.z64",
-             use_rom_dir ? ROM_DUMP_DIR : "sd:", info->product);
-    snprintf(info->save_path, sizeof(info->save_path), "%s/%s.sav",
-             use_save_dir ? SAVE_DUMP_DIR : "sd:", info->product);
+static char revision_suffix(uint8_t revision) {
+    if (revision == 0 || revision > 26) {
+        return '\0';
+    }
+
+    return (char)('A' + revision - 1);
+}
+
+static void print_revision_suffix(uint8_t revision) {
+    const char suffix = revision_suffix(revision);
+    if (suffix != '\0') {
+        printf(" (%c)", suffix);
+    }
+}
+
+static void format_cart_file_path(char *out, size_t out_size, const cart_info_t *info,
+                                  const char *dir, const char *ext) {
+    const char suffix = revision_suffix(info->revision);
+    if (suffix != '\0') {
+        snprintf(out, out_size, "%s/%s%c.%s", dir, info->product, suffix, ext);
+    } else {
+        snprintf(out, out_size, "%s/%s.%s", dir, info->product, ext);
+    }
+}
+
+static void set_cart_paths(cart_info_t *info) {
+    format_cart_file_path(info->rom_path, sizeof(info->rom_path), info, "sd:", "z64");
+    format_cart_file_path(info->save_path, sizeof(info->save_path), info, "sd:", "sav");
 }
 
 static void parse_cart_info(cart_info_t *info, const uint8_t *header) {
@@ -253,9 +281,10 @@ static void parse_cart_info(cart_info_t *info, const uint8_t *header) {
         info->product[i] = printable_header_char(header[CART_PRODUCT_OFFSET + i]);
     }
     info->product[CART_PRODUCT_LENGTH] = '\0';
+    info->revision = header[CART_REVISION_OFFSET];
     info->region = header[CART_REGION_OFFSET];
 
-    set_cart_paths(info, false, false);
+    set_cart_paths(info);
 }
 
 static void cart_dma_read(void *ram, size_t cart_offset, size_t len) {
@@ -281,14 +310,14 @@ static uint32_t comp_hash4(const uint8_t *data) {
     return (read_u32_unaligned(data) * 2654435761u) >> (32 - COMP_HASH_BITS);
 }
 
-static void comp_insert_pos(const uint8_t *src, size_t pos, int32_t *head) {
-    const uint32_t hash = comp_hash4(src + pos);
-    head[hash] = (int32_t)pos;
-}
-
 static size_t comp_match_len(const uint8_t *a, const uint8_t *b,
                              size_t max_len) {
     size_t len = 0;
+
+    while ((len + 4) <= max_len &&
+           read_u32_unaligned(a + len) == read_u32_unaligned(b + len)) {
+        len += 4;
+    }
 
     while (len < max_len && a[len] == b[len]) {
         len++;
@@ -297,10 +326,11 @@ static size_t comp_match_len(const uint8_t *a, const uint8_t *b,
     return len;
 }
 
-static size_t comp_find_match(const uint8_t *src, size_t src_len, size_t pos,
-                              const int32_t *head, size_t *match_offset) {
+static size_t comp_find_and_insert_match(const uint8_t *src, size_t src_len, size_t pos,
+                                         int32_t *head, size_t *match_offset) {
     const uint32_t hash = comp_hash4(src + pos);
     const int32_t candidate = head[hash];
+    head[hash] = (int32_t)pos;
 
     if (candidate < 0) {
         return 0;
@@ -341,17 +371,24 @@ static size_t comp_lz4_block(const uint8_t *src, size_t src_len, uint8_t *dst,
     size_t in_pos = 0;
     size_t anchor = 0;
     size_t out_pos = 0;
+    size_t misses = 0;
 
     while ((in_pos + COMP_MIN_MATCH) <= src_len) {
         size_t match_offset = 0;
-        size_t match_len = comp_find_match(src, src_len, in_pos, head, &match_offset);
-        comp_insert_pos(src, in_pos, head);
+        size_t match_len = comp_find_and_insert_match(src, src_len, in_pos,
+                                                      head, &match_offset);
 
         if (match_len < COMP_MIN_MATCH) {
-            in_pos++;
+            size_t step = 1 + (misses >> COMP_SKIP_STRENGTH);
+            if (step > 16) {
+                step = 16;
+            }
+            in_pos += step;
+            misses++;
             continue;
         }
 
+        misses = 0;
         const size_t token_pos = out_pos++;
         if (token_pos >= dst_cap) {
             return 0;
@@ -381,15 +418,8 @@ static size_t comp_lz4_block(const uint8_t *src, size_t src_len, uint8_t *dst,
         }
         dst[token_pos] = token;
 
-        const size_t match_start = in_pos;
         in_pos += match_len;
         anchor = in_pos;
-
-        for (size_t pos = match_start + 1;
-             (pos + COMP_MIN_MATCH) <= src_len && pos < in_pos;
-             pos++) {
-            comp_insert_pos(src, pos, head);
-        }
     }
 
     const size_t lit_len = src_len - anchor;
@@ -712,7 +742,8 @@ static bool wait_for_ready_game_cart(uint8_t *scratch, size_t scratch_size,
 
         if (!first_insert) {
             if (memcmp(header + CART_PRODUCT_OFFSET, info->header + CART_PRODUCT_OFFSET,
-                       CART_PRODUCT_LENGTH) == 0) {
+                       CART_PRODUCT_LENGTH) == 0 &&
+                header[CART_REVISION_OFFSET] == info->header[CART_REVISION_OFFSET]) {
                 return true;
             }
 
@@ -744,7 +775,7 @@ static bool wait_for_ready_game_cart(uint8_t *scratch, size_t scratch_size,
 
 static void print_header(void) {
     console_clear();
-    printf("N64 SwapDumper\n\n");
+    printf("N64 SwapDumper v0.2 (Shark Week)\n\n");
 }
 
 static void pause_after_error(void) {
@@ -775,7 +806,7 @@ static bool wait_for_a_or_b(void) {
 
 static int find_size_option(size_t size) {
     static const size_t size_options[] = {
-        4, 8, 12, 16, 20, 32, 64,
+        4, 8, 12, 16, 20, 32, 40, 64,
     };
 
     for (int i = 0; i < (int)(sizeof(size_options) / sizeof(size_options[0])); i++) {
@@ -789,15 +820,24 @@ static int find_size_option(size_t size) {
 
 static bool select_rom_size(cart_info_t *info) {
     static const size_t size_options[] = {
-        4, 8, 12, 16, 20, 32, 64,
+        4, 8, 12, 16, 20, 32, 40, 64,
     };
 
     int selected = find_size_option(info->detected_size);
 
     while (true) {
         print_header();
-        printf("Title: %s\n", info->title);
-        printf("Product: %s  Region: %c\n", info->product, printable_header_char(info->region));
+        printf("Title: %s", info->title);
+        print_revision_suffix(info->revision);
+        printf("\n");
+        printf("Product: %s", info->product);
+        if (revision_suffix(info->revision) != '\0') {
+            printf("  Rev: %c", revision_suffix(info->revision));
+        }
+        printf("  Region: %c\n", printable_header_char(info->region));
+        printf("CRC: %08" PRIX32 " %08" PRIX32 "\n",
+               read_be32(info->header + CART_CRC1_OFFSET),
+               read_be32(info->header + CART_CRC2_OFFSET));
         printf("ROM file: %s\n\n", info->rom_path);
         printf("ROM size: %u MiB", (unsigned)size_options[selected]);
         if ((size_options[selected] * 0x100000) == info->detected_size) {
@@ -951,18 +991,156 @@ static bool write_all(int fd, const uint8_t *buf, size_t len) {
     return true;
 }
 
+static bool read_all(int fd, uint8_t *buf, size_t len) {
+    size_t done = 0;
+
+    while (done < len) {
+        const size_t left = len - done;
+        const ssize_t res = read(fd, buf + done, left);
+        if ((res == 0) || (res == -1)) {
+            return false;
+        }
+
+        done += (size_t)res;
+    }
+
+    return true;
+}
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, size_t len) {
+    static uint32_t table[256];
+    static bool table_ready = false;
+
+    if (!table_ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t value = i;
+            for (int bit = 0; bit < 8; bit++) {
+                if ((value & 1) != 0) {
+                    value = (value >> 1) ^ CRC32_POLY;
+                } else {
+                    value >>= 1;
+                }
+            }
+            table[i] = value;
+        }
+        table_ready = true;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    }
+
+    return crc;
+}
+
+static size_t checksum_read_len(size_t buffer_size, size_t remaining) {
+    size_t len = buffer_size;
+
+    if (len > CHECKSUM_READ_SIZE) {
+        len = CHECKSUM_READ_SIZE;
+    }
+    if (len > remaining) {
+        len = remaining;
+    }
+
+    return len;
+}
+
+static bool checksum_cart_rom(uint8_t *buf, size_t buf_size, size_t rom_size,
+                              uint32_t *out_crc) {
+    uint32_t crc = 0xFFFFFFFFu;
+    size_t offset = 0;
+    size_t next_report = 0;
+
+    if (buf_size == 0) {
+        return false;
+    }
+
+    print_header();
+    printf("Calculating cartridge CRC32...\n");
+    printf("This covers the full selected ROM.\n\n");
+    printf("0/%u MiB\n", (unsigned)(rom_size / 0x100000));
+    console_render();
+
+    while (offset < rom_size) {
+        const size_t len = checksum_read_len(buf_size, rom_size - offset);
+
+        cart_dma_read(buf, offset, len);
+        crc = crc32_update(crc, buf, len);
+        offset += len;
+
+        if (offset >= next_report) {
+            print_header();
+            printf("Calculating cartridge CRC32...\n");
+            printf("This covers the full selected ROM.\n\n");
+            printf("%u/%u MiB\n",
+                   (unsigned)(offset / 0x100000),
+                   (unsigned)(rom_size / 0x100000));
+            console_render();
+            next_report = offset + 0x100000;
+        }
+    }
+
+    *out_crc = crc ^ 0xFFFFFFFFu;
+    return true;
+}
+
+static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
+                             size_t size, uint32_t *out_crc) {
+    const int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        printf("Failed to open %s\nErrno: %d (%s)\n", path, errno, strerror(errno));
+        console_render();
+        return false;
+    }
+
+    uint32_t crc = 0xFFFFFFFFu;
+    size_t offset = 0;
+    size_t next_report = 0;
+
+    if (buf_size == 0) {
+        close(fd);
+        return false;
+    }
+
+    while (offset < size) {
+        const size_t len = checksum_read_len(buf_size, size - offset);
+
+        if (!read_all(fd, buf, len)) {
+            printf("Failed to read %s\nErrno: %d (%s)\n", path, errno, strerror(errno));
+            console_render();
+            close(fd);
+            return false;
+        }
+
+        crc = crc32_update(crc, buf, len);
+        offset += len;
+
+        if (offset >= next_report) {
+            print_header();
+            printf("Verifying SD file CRC32...\n");
+            printf("%s\n\n", path);
+            printf("%u/%u MiB\n",
+                   (unsigned)(offset / 0x100000),
+                   (unsigned)(size / 0x100000));
+            console_render();
+            next_report = offset + 0x100000;
+        }
+    }
+
+    if (close(fd) == -1) {
+        printf("Failed to close %s\nErrno: %d (%s)\n", path, errno, strerror(errno));
+        console_render();
+        return false;
+    }
+
+    *out_crc = crc ^ 0xFFFFFFFFu;
+    return true;
+}
+
 static bool file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
-}
-
-static bool dir_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-static void resolve_output_paths(cart_info_t *info) {
-    set_cart_paths(info, dir_exists(ROM_DUMP_DIR), dir_exists(SAVE_DUMP_DIR));
 }
 
 static bool confirm_save_overwrite(const char *path) {
@@ -976,16 +1154,25 @@ static bool confirm_save_overwrite(const char *path) {
     return wait_for_a_or_b();
 }
 
-static bool write_sd_file(const char *path, const uint8_t *buf, size_t len, bool append, size_t offset) {
+static int open_sd_output_file(const char *path, bool append, bool quiet) {
     int flags = O_WRONLY | O_CREAT;
     if (!append) {
         flags |= O_TRUNC;
     }
 
     const int fd = open(path, flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-    if (fd == -1) {
+    if (fd == -1 && !quiet) {
         printf("Failed to open %s\nErrno: %d (%s)\n", path, errno, strerror(errno));
         console_render();
+    }
+
+    return fd;
+}
+
+static bool write_sd_file_to_path(const char *path, const uint8_t *buf, size_t len,
+                                  bool append, size_t offset, bool quiet_open) {
+    const int fd = open_sd_output_file(path, append, quiet_open);
+    if (fd == -1) {
         return false;
     }
 
@@ -1012,6 +1199,10 @@ static bool write_sd_file(const char *path, const uint8_t *buf, size_t len, bool
     return true;
 }
 
+static bool write_sd_file(const char *path, const uint8_t *buf, size_t len, bool append, size_t offset) {
+    return write_sd_file_to_path(path, buf, len, append, offset, false);
+}
+
 static void comp_write_header(uint8_t *dst, const comp_block_header_t *header) {
     memcpy(dst, header, sizeof(*header));
 }
@@ -1024,10 +1215,12 @@ static comp_block_header_t comp_read_header(const uint8_t *src) {
 
 static void draw_dump_progress(void) {
     console_clear();
-    printf("N64 SwapDumper\n\n");
+    printf("N64 SwapDumper v0.2 (Shark Week)\n\n");
 
     if (dprog.cart) {
-        printf("Title:   %s\n", dprog.cart->title);
+        printf("Title:   %s", dprog.cart->title);
+        print_revision_suffix(dprog.cart->revision);
+        printf("\n");
         printf("Size:    %u MiB\n\n",
                (unsigned)(dprog.total_size / 0x100000));
     }
@@ -1131,12 +1324,10 @@ static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap, uint8_t *bloc
 
 static bool write_compressed_pass_to_sd(const char *path, const uint8_t *comp_buf,
                                         const compressed_pass_t *pass,
-                                        uint8_t *block_buf, bool append) {
-    const int flags = O_WRONLY | O_CREAT | (append ? 0 : O_TRUNC);
-    const int fd = open(path, flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+                                        uint8_t *block_buf, bool append,
+                                        bool quiet_open) {
+    const int fd = open_sd_output_file(path, append, quiet_open);
     if (fd == -1) {
-        printf("Failed to open %s\nErrno: %d (%s)\n", path, errno, strerror(errno));
-        console_render();
         return false;
     }
 
@@ -1203,6 +1394,55 @@ static bool write_compressed_pass_to_sd(const char *path, const uint8_t *comp_bu
     }
 
     return true;
+}
+
+static bool write_rom_pass_to_sd(cart_info_t *cart, const uint8_t *comp_buf,
+                                 const compressed_pass_t *pass,
+                                 uint8_t *block_buf, bool append) {
+    char path[sizeof(cart->rom_path)];
+
+    if (append) {
+        return write_compressed_pass_to_sd(cart->rom_path, comp_buf, pass,
+                                           block_buf, true, false);
+    }
+
+    format_cart_file_path(path, sizeof(path), cart, ROM_DUMP_DIR, "z64");
+    if (write_compressed_pass_to_sd(path, comp_buf, pass, block_buf, false, true)) {
+        strcpy(cart->rom_path, path);
+        return true;
+    }
+
+    format_cart_file_path(path, sizeof(path), cart, "sd:", "z64");
+    strcpy(cart->rom_path, path);
+    return write_compressed_pass_to_sd(cart->rom_path, comp_buf, pass,
+                                       block_buf, false, false);
+}
+
+static bool write_save_file_to_sd(cart_info_t *cart, const uint8_t *save_buf,
+                                  const save_info_t *save_info) {
+    char path[sizeof(cart->save_path)];
+
+    format_cart_file_path(path, sizeof(path), cart, SAVE_DUMP_DIR, "sav");
+    if (file_exists(path) && !confirm_save_overwrite(path)) {
+        printf("Save write cancelled\n");
+        console_render();
+        return false;
+    }
+
+    if (write_sd_file_to_path(path, save_buf, save_info->size, false, 0, true)) {
+        strcpy(cart->save_path, path);
+        return true;
+    }
+
+    format_cart_file_path(path, sizeof(path), cart, "sd:", "sav");
+    if (!confirm_save_overwrite(path)) {
+        printf("Save write cancelled\n");
+        console_render();
+        return false;
+    }
+
+    strcpy(cart->save_path, path);
+    return write_sd_file(cart->save_path, save_buf, save_info->size, false, 0);
 }
 
 static size_t align_down_size(size_t value, size_t align) {
@@ -1298,6 +1538,9 @@ void dump_rom(void) {
     uint8_t *save_buf = NULL;
     size_t chunk = 0;
     size_t offset = 0;
+    uint32_t cart_full_crc = 0;
+    uint32_t sd_full_crc = 0;
+    bool have_cart_full_crc = false;
     bool first_pass = true;
     bool ok = true;
 
@@ -1370,6 +1613,17 @@ void dump_rom(void) {
         }
     }
 
+    if (ok && dump_mode != DUMP_MODE_SAVE_ONLY) {
+        if (!checksum_cart_rom(comp_buf, chunk, cart.selected_size, &cart_full_crc)) {
+            ok = false;
+            pause_after_error();
+        } else {
+            have_cart_full_crc = true;
+            printf("Cartridge CRC32: %08" PRIX32 "\n", cart_full_crc);
+            console_render();
+        }
+    }
+
     dprog.cart = &cart;
     dprog.total_size = cart.selected_size;
     dprog.read_addr = 0;
@@ -1410,17 +1664,9 @@ void dump_rom(void) {
         swap("flashcart", "write");
         wait_for_a_press();
         remount_sd();
-        resolve_output_paths(&cart);
 
         if (first_pass && dump_mode != DUMP_MODE_ROM_ONLY) {
-            if (!confirm_save_overwrite(cart.save_path)) {
-                printf("Save write cancelled\n");
-                console_render();
-                ok = false;
-                break;
-            }
-
-            if (!write_sd_file(cart.save_path, save_buf, save_info.size, false, 0)) {
+            if (!write_save_file_to_sd(&cart, save_buf, &save_info)) {
                 ok = false;
                 pause_after_error();
                 break;
@@ -1432,8 +1678,8 @@ void dump_rom(void) {
             save_buf = NULL;
         }
 
-        if (!write_compressed_pass_to_sd(cart.rom_path, comp_buf, &pass,
-                                         block_buf, offset != 0)) {
+        if (!write_rom_pass_to_sd(&cart, comp_buf, &pass,
+                                  block_buf, offset != 0)) {
             ok = false;
             pause_after_error();
             break;
@@ -1447,24 +1693,36 @@ void dump_rom(void) {
         first_pass = false;
     }
 
+    if (ok && dump_mode != DUMP_MODE_SAVE_ONLY && have_cart_full_crc) {
+        if (!checksum_sd_file(cart.rom_path, comp_buf, chunk, cart.selected_size, &sd_full_crc)) {
+            ok = false;
+            pause_after_error();
+        } else {
+            print_header();
+            printf("Full ROM CRC32\n\n");
+            printf("Cart: %08" PRIX32 "\n", cart_full_crc);
+            printf("SD:   %08" PRIX32 "\n\n", sd_full_crc);
+            printf("%s\n\n", (sd_full_crc == cart_full_crc) ? "Checksum matches" : "CHECKSUM MISMATCH");
+            printf("Press A to continue\n");
+            console_render();
+            wait_for_a_press();
+            if (sd_full_crc != cart_full_crc) {
+                ok = false;
+            }
+        }
+    }
+
     if (ok && dump_mode == DUMP_MODE_SAVE_ONLY) {
         swap("flashcart", "write");
         wait_for_a_press();
         remount_sd();
-        resolve_output_paths(&cart);
 
-        if (!confirm_save_overwrite(cart.save_path)) {
-            printf("Save write cancelled\n");
-            console_render();
+        if (!write_save_file_to_sd(&cart, save_buf, &save_info)) {
             ok = false;
+            pause_after_error();
         } else {
-            if (!write_sd_file(cart.save_path, save_buf, save_info.size, false, 0)) {
-                ok = false;
-                pause_after_error();
-            } else {
-                printf("Wrote save to %s\n", cart.save_path);
-                console_render();
-            }
+            printf("Wrote save to %s\n", cart.save_path);
+            console_render();
         }
     }
 
