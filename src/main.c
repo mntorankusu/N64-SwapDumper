@@ -93,7 +93,6 @@ static int shark_errno = 0;
 #define VI_CTRL_REG ((volatile uint32_t *)0xA4400000)
 #define VI_PIXEL_ADVANCE_MASK (0xF << 12)
 #define VI_PIXEL_ADVANCE(value) (((value) & 0xF) << 12)
-#define VI_AA_MODE_MASK (0x3 << 8)
 #define VI_AA_MODE_NONE (0x3 << 8)
 #define CONSOLE_VI_BASE_OUTPUT_WIDTH ((CONSOLE_FRAMEBUFFER_WIDTH * CONSOLE_H_STRETCH_PERCENT) / 100)
 #define CONSOLE_VI_OUTPUT_WIDTH (((CONSOLE_FRAMEBUFFER_WIDTH + CONSOLE_RIGHT_EXTEND_PIXELS) * CONSOLE_H_STRETCH_PERCENT) / 100)
@@ -113,8 +112,6 @@ static int shark_errno = 0;
 #define PI_BSD_DOM2_PWD_REG ((volatile uint32_t *)0xA4600028)
 #define PI_BSD_DOM2_PGS_REG ((volatile uint32_t *)0xA460002C)
 #define PI_BSD_DOM2_RLS_REG ((volatile uint32_t *)0xA4600030)
-#define PI_STATUS_DMA_BUSY 0x01
-#define PI_STATUS_IO_BUSY 0x02
 
 #define SAVE_SRAM_SIZE 0x8000
 #define SAVE_FLASH_SIZE 0x20000
@@ -468,7 +465,7 @@ static const char LOC_GENERIC_ERROR[] = "Err\n";
 
 static const loc_t LOC = {
     .generic_error = LOC_GENERIC_ERROR,
-    .app_header = "N64 SwapDumper v0.3\n",
+    .app_header = "N64SwapDumper v0.3(Shrk)\n",
     .newline = "\n",
     .revision_suffix_fmt = " (%c)",
     .press_a_continue = "A: OK\n",
@@ -588,7 +585,7 @@ static const loc_t LOC = {
     .restore_success = "Save restored\n",
     .err_ique = LOC_GENERIC_ERROR,
     .main_dump_sd =         "A:      Dump to SD\n",
-    .main_dump_accessory =  "B:      Dump to accessory\n",
+    .main_dump_accessory =  "B:      Dump to Joybus\n",
     .main_restore =         "C-Up:   Restore save\n",
     .main_clear_save =      "Z+Down: Clear save\n",
     .clear_title = "Clear save\n",
