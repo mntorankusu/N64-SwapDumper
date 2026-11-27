@@ -17,6 +17,16 @@ This application works by allowing you to boot with a flash cart, and then swap 
 #### Press Z+Down: Clear Save
 - This allows you to erase the save data on a cartridge. You will be asked to press reset and then swap to the cartridge that you want to erase. It will then ask if you're sure, and then ask you to press Z+L+Start to make sure that this isn't happening accidentally.
 
+## Header CRC check
+Before dumping, the cartridge header CRC is checked against the known CIC variants. Some cartridges, such as homebrew built with libdragon's open-source IPL3, have a zero or nonstandard header CRC and still boot fine on hardware. If the check fails, you can press A to retry or Start to skip the check and dump anyway. The full-ROM CRC32 comparison at the end of the dump still verifies that the SD file matches the cartridge.
+
+## ModRetro 64 cartridges
+ModRetro 64 cartridges don't work with most standard cartridge readers, but they can be dumped with this application. Tested: Xibalba, Buck Bumble, XenoCrisis, and Extreme-G.
+- Xibalba has no header CRC, so you will need to skip the CRC check (see above).
+- Carts that don't have a save chip (Buck Bumble, XenoCrisis, Extreme-G) can stop returning ROM data after the save probe, so dump them with **ROM only**. If this happens during a ROM + save dump, the dump stops with an error instead of writing an empty ROM. Power cycle the console before trying again.
+- Xibalba's EEPROM save can be dumped normally.
+- Check the detected ROM size before dumping. Extreme-G was detected as 8MB even though its data extends to about 21MB, which produced a dump that doesn't boot. If you're unsure, select 64MB; the extra padding at the end can be trimmed off afterwards.
+
 ## Disclaimer
 
 THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. BY USING THIS SOFTWARE YOU ACKNOWLEDGE AND AGREE THAT:

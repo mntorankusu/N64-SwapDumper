@@ -93,6 +93,9 @@ static int shark_errno = 0;
 #define VI_CTRL_REG ((volatile uint32_t *)0xA4400000)
 #define VI_PIXEL_ADVANCE_MASK (0xF << 12)
 #define VI_PIXEL_ADVANCE(value) (((value) & 0xF) << 12)
+#ifndef VI_AA_MODE_MASK
+#define VI_AA_MODE_MASK (0x3 << 8)
+#endif
 #define VI_AA_MODE_NONE (0x3 << 8)
 #define CONSOLE_VI_BASE_OUTPUT_WIDTH ((CONSOLE_FRAMEBUFFER_WIDTH * CONSOLE_H_STRETCH_PERCENT) / 100)
 #define CONSOLE_VI_OUTPUT_WIDTH (((CONSOLE_FRAMEBUFFER_WIDTH + CONSOLE_RIGHT_EXTEND_PIXELS) * CONSOLE_H_STRETCH_PERCENT) / 100)
@@ -112,6 +115,12 @@ static int shark_errno = 0;
 #define PI_BSD_DOM2_PWD_REG ((volatile uint32_t *)0xA4600028)
 #define PI_BSD_DOM2_PGS_REG ((volatile uint32_t *)0xA460002C)
 #define PI_BSD_DOM2_RLS_REG ((volatile uint32_t *)0xA4600030)
+#ifndef PI_STATUS_DMA_BUSY
+#define PI_STATUS_DMA_BUSY 0x01
+#endif
+#ifndef PI_STATUS_IO_BUSY
+#define PI_STATUS_IO_BUSY 0x02
+#endif
 
 #define SAVE_SRAM_SIZE 0x8000
 #define SAVE_FLASH_SIZE 0x20000
@@ -351,6 +360,9 @@ typedef struct {
     const char *err_crc_failed;
     const char *crc_expected;
     const char *crc_read_as;
+    const char *crc_missing;
+    const char *prompt_crc_skip;
+    const char *crc_unverified;
     const char *err_different_cart;
     const char *detecting_rom_size;
     const char *err_size_scratch_small;
@@ -409,6 +421,7 @@ typedef struct {
     const char *err_alloc_rom;
     const char *reading_save;
     const char *err_read_save_data;
+    const char *err_cart_lost_after_save;
     const char *rom_buffer;
     const char *compression_label;
     const char *compression_blocks_short;
@@ -489,6 +502,9 @@ static const loc_t LOC = {
     .err_crc_failed = "CRC err\n",
     .crc_expected = "W:%08"PRIX32"%08"PRIX32"\n",
     .crc_read_as = "G:%08"PRIX32"%08"PRIX32"(%s)\n",
+    .crc_missing = "No CRC in header\n",
+    .prompt_crc_skip = "A:Retry Start:Skip check\n",
+    .crc_unverified = "CRC unverified\n",
     .err_different_cart = LOC_GENERIC_ERROR,
     .detecting_rom_size = "Detect...\n",
     .err_size_scratch_small = LOC_GENERIC_ERROR,
@@ -547,6 +563,7 @@ static const loc_t LOC = {
     .err_alloc_rom = LOC_GENERIC_ERROR,
     .reading_save = "Read save %s, %u B\n",
     .err_read_save_data = "Save read failed\n",
+    .err_cart_lost_after_save = "Cart stopped responding\nafter save access.\nPower cycle, then\ndump ROM only.\n",
     .rom_buffer = "",
     .compression_label = "Comp: ",
     .compression_blocks_short = "%u KB blocks\n",
@@ -924,6 +941,27 @@ static void wait_for_a_press(void) {
         poll_controller();
         wait_ms(16);
     } while (!INPUT(btn.a));
+}
+
+// Returns true for Start, false for A.
+static bool wait_for_a_or_start(void) {
+    do {
+        poll_controller();
+        wait_ms(16);
+    } while (inputs.btn.a || inputs.btn.start);
+
+    while (true) {
+        poll_controller();
+
+        if (INPUT(btn.a)) {
+            return false;
+        }
+        if (INPUT(btn.start)) {
+            return true;
+        }
+
+        wait_ms(16);
+    }
 }
 
 static void wait_pi_idle(void) {
@@ -1861,6 +1899,15 @@ static size_t detect_game_cart_size(uint8_t *scratch, size_t scratch_size) {
 }
 
 static bool wait_for_valid_game_cart(uint8_t *scratch, size_t scratch_size, uint8_t *out_header) {
+    // Some carts (e.g. newer homebrew/ModRetro releases using an IPL3 that skips
+    // the ROM checksum) ship with a zero or nonstandard header CRC. Once the user
+    // skips the check for a cart, accept later swaps of that same cart as long as
+    // the header and the calculated checksum read back identically.
+    static uint8_t skipped_header[CART_HEADER_SIZE];
+    static uint32_t skipped_crc1;
+    static uint32_t skipped_crc2;
+    static bool skipped_valid = false;
+
     uint8_t header[CART_HEADER_SIZE] __attribute__((aligned(8))) = {0};
     cart_crc_result_t crc = {0};
 
@@ -1890,12 +1937,38 @@ static bool wait_for_valid_game_cart(uint8_t *scratch, size_t scratch_size, uint
             if (!cart_header_valid(scratch) ||
                 memcmp(header, scratch, CART_HEADER_SIZE) != 0) {
                 print_loc(LOC.err_header_changed);
+            } else if (skipped_valid &&
+                       memcmp(header, skipped_header, CART_HEADER_SIZE) == 0 &&
+                       crc.calculated_crc1 == skipped_crc1 &&
+                       crc.calculated_crc2 == skipped_crc2) {
+                print_loc(LOC.crc_unverified);
+                shark_console_render();
+                memcpy(out_header, header, CART_HEADER_SIZE);
+                return true;
             } else {
-                print_loc(LOC.err_crc_failed);
+                if (crc.expected_crc1 == 0 && crc.expected_crc2 == 0) {
+                    print_loc(LOC.crc_missing);
+                } else {
+                    print_loc(LOC.err_crc_failed);
+                }
                 printf(LOC.crc_expected,
                        crc.expected_crc1, crc.expected_crc2);
                 printf(LOC.crc_read_as,
                        crc.calculated_crc1, crc.calculated_crc2, crc.cic_name);
+                print_loc(LOC.prompt_crc_skip);
+                shark_console_render();
+
+                if (wait_for_a_or_start()) {
+                    memcpy(skipped_header, header, CART_HEADER_SIZE);
+                    skipped_crc1 = crc.calculated_crc1;
+                    skipped_crc2 = crc.calculated_crc2;
+                    skipped_valid = true;
+                    print_loc(LOC.crc_unverified);
+                    shark_console_render();
+                    memcpy(out_header, header, CART_HEADER_SIZE);
+                    return true;
+                }
+                continue;
             }
         }
 
@@ -3900,6 +3973,21 @@ void dump_rom(void) {
         }
     }
 
+    // Some carts (e.g. ModRetro 64 carts without a save chip) stop returning
+    // ROM data after the save probe/read touches domain 2, which would otherwise
+    // produce an all-zero ROM that still "verifies" against the cart.
+    if (ok && dump_mode == DUMP_MODE_ROM_AND_SAVE) {
+        uint8_t recheck[CART_HEADER_SIZE] __attribute__((aligned(8))) = {0};
+
+        if (!probe_game_cart(recheck) ||
+            memcmp(recheck, cart.header, CART_HEADER_SIZE) != 0) {
+            print_loc(LOC.err_cart_lost_after_save);
+            shark_console_render();
+            ok = false;
+            pause_after_error();
+        }
+    }
+
     if (ok && dump_mode != DUMP_MODE_SAVE_ONLY && !have_cart_full_crc) {
         if (!checksum_cart_rom(comp_buf, chunk, cart.selected_size, &cart_full_crc)) {
             ok = false;
@@ -4053,6 +4141,9 @@ void dump_rom(void) {
             printf(LOC.checksum_status, (sd_full_crc == cart_full_crc) ? LOC.checksum_matches : LOC.checksum_mismatch);
             print_loc(LOC.press_a_continue);
             shark_console_render();
+            if (sd_full_crc == cart_full_crc) {
+                delete_part_meta(&cart);
+            }
             wait_for_a_press();
             if (sd_full_crc != cart_full_crc) {
                 ok = false;
